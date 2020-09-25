@@ -1,24 +1,39 @@
 package goth
 
+/*
+todo:
+  - add callback for when not authorized
+*/
+
 import (
 	"log"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 )
 
+// AuthorizeFunc returns the user as an interface type, a list of the user's roles and  an optional
+// error. If user is nil the user will be considered authenticated and will  only be allowed to
+// access "annon" paths. The list of roles are simple strings that are matched (case sensitive) when
+// defining authorization rules. If an error is returned by this function, it will be logged to
+// strerr and a HTTP 500 response will be sent.
 type AuthorizerFunc func(req *http.Request) (user interface{}, roles []string, err error)
 
-type urlPattern struct {
-	pattern     string
-	regex       *regexp.Regexp
-	specificity int
-}
-
 type urlRule struct {
+	// regex to match against URL path
+	regex *regexp.Regexp
+
+	// allow users that have these one of the roles
 	roles []string
+
+	// allow any authenticated user
 	allow bool
-	deny  bool
+
+	// deny all access
+	deny bool
+
+	// allow any user regardless of authentication
 	annon bool
 }
 
@@ -27,13 +42,13 @@ type Goth struct {
 	authorizer AuthorizerFunc
 
 	// The URL path that will be used to redirect unauthenticated/unauthorized users
-	loginPath string
+	loginURL *url.URL
 
 	// Underlying handler being wrapped
 	handler http.Handler
 
-	// Map from url pattern to rule string
-	rules map[*urlPattern]*urlRule
+	// Slice of defined rules
+	rules []urlRule
 
 	// Determine if requests to undefined paths will be allowed or denied
 	allowMissing bool
@@ -41,29 +56,95 @@ type Goth struct {
 
 type Opts func(*Goth)
 
-func New(opts ...Opts) Goth {
-	g := Goth{
-		rules:        map[*urlPattern]*urlRule{},
+// New creates a new Goth instance.
+func New(handler http.Handler, authorizer AuthorizerFunc) *Goth {
+	return &Goth{
+		authorizer:   authorizer,
+		handler:      handler,
+		rules:        []urlRule{},
 		allowMissing: false,
 	}
-	for _, opts := range opts {
-		opts(&g)
+}
+
+func (g *Goth) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	path := req.URL.Path
+
+	// if this is a request to the loginPath we should allow it
+	if g.loginURL != nil && path == g.loginURL.Path {
+		g.handler.ServeHTTP(w, req)
+		return
 	}
-	return g
+
+	user, userRoles, err := g.authorizer(req)
+	if err != nil {
+		log.Printf("error authorizing user: %v", err)
+		http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+		return
+	}
+
+	// match the request with defined rules
+	ruleFound := false
+	var rule urlRule
+	for i := 0; i < len(g.rules); i++ {
+		rule = g.rules[i]
+		if rule.regex.MatchString(path) {
+			ruleFound = true
+			break
+		}
+	}
+
+	// no rules were found for this path and we are configured to allow missing paths
+	if !ruleFound && g.allowMissing {
+		g.handler.ServeHTTP(w, req)
+		return
+	}
+
+	// send appropriate http status if no rules are found
+	if !ruleFound {
+		g.denyRequest(w, req, user)
+		return
+	}
+
+	// apply the selected rule
+	switch {
+	case rule.deny:
+		g.denyRequest(w, req, user)
+	case rule.allow && user == nil:
+		g.denyRequest(w, req, user)
+	case rule.annon:
+		g.handler.ServeHTTP(w, req)
+	case len(rule.roles) > 0:
+		if checkUserHasRole(rule.roles, userRoles) {
+			g.handler.ServeHTTP(w, req)
+		} else {
+			g.denyRequest(w, req, user)
+		}
+	default:
+		g.denyRequest(w, req, user)
+	}
 }
 
-func (g Goth) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	g.handler.ServeHTTP(w, req)
+// checkUserHasRole checks if the user have at least one of the rule's role
+func checkUserHasRole(ruleRoles, userRoles []string) bool {
+	for _, role1 := range ruleRoles {
+		for _, role2 := range userRoles {
+			if role1 == role2 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
-// AuthorizeFunc returns the user as an interface type, a list of the user's roles and  an optional
-// error. If user is nil the user will be considered authenticated and will  only be allowed to
-// access "annon" paths. The list of roles are simple strings that are matched (case sensitive) when
-// defining authorization rules. If an error is returned by this function, it will be logged to
-// strerr and a HTTP 500 response will be sent.
-func Authorizer(af AuthorizerFunc) Opts {
-	return func(g *Goth) {
-		g.authorizer = af
+// denyRequest sends the appropriate denial http response back to the user
+func (g *Goth) denyRequest(w http.ResponseWriter, req *http.Request, user interface{}) {
+	log.Printf("Request to %s denied to user %v", req.URL, user)
+	if g.loginURL != nil {
+		http.Redirect(w, req, g.loginURL.String(), http.StatusFound)
+	} else if user == nil {
+		http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+	} else {
+		http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 	}
 }
 
@@ -85,86 +166,40 @@ func Authorizer(af AuthorizerFunc) Opts {
 //
 //   deny > list of roles > allow > annon
 //
-// Also always the most specific pattern will be applied. For example, given the rules:
-//
-//   Rule("/admin/users/?(.*?)", "admin")
-//   Rule("/admin/?(.*?)", "allow")
-//
-// When accessing path "/admin/users/123" both rules would match, but the first one will be
-// applied because it is more specific to the "/admin/users" segment.
-// The specificity of the pattern is determined by the number of forward slashes "/" in it, the more
-// it have the more specific it is considered.
-func Rule(pattern, rule string) Opts {
-	return func(g *Goth) {
-		r, err := regexp.Compile(pattern)
-		if err != nil {
-			log.Fatalf("invalid regular expressiong %s: %v", pattern, err)
-		}
-		urlP := &urlPattern{
-			pattern:     pattern,
-			regex:       r,
-			specificity: strings.Count(pattern, "/"),
-		}
-
-		urlR := &urlRule{}
-		switch rule {
-		case "allow":
-			urlR.allow = true
-		case "deny":
-			urlR.deny = true
-		case "annon":
-			urlR.annon = true
-		default:
-			urlR.roles = strings.Split(rule, ",")
-		}
-
-		g.rules[urlP] = urlR
+// Also, the order of rules are important, the rule to be applied is the first one that matches
+// based on their definition order.
+func (g *Goth) Rule(pattern, rule string) {
+	rx, err := regexp.Compile(pattern)
+	if err != nil {
+		log.Fatalf("invalid regular expressiong %s: %v", pattern, err)
 	}
+	r := urlRule{regex: rx}
+	switch rule {
+	case "allow":
+		r.allow = true
+	case "deny":
+		r.deny = true
+	case "annon":
+		r.annon = true
+	default:
+		r.roles = strings.Split(rule, ",")
+	}
+	g.rules = append(g.rules, r)
 }
 
-// LoginPath sets the URL path that will be used to redirect unauthenticated/unauthorized users. If
+// LoginURL sets the URL path that will be used to redirect unauthenticated/unauthorized users. If
 // the login path is not set, an HTTP 401 (unauthorized) or 403 (forbidden) response will be
 // returned (depending if the Authorizer function returns a user or not).
-func LoginPath(path string) Opts {
-	return func(g *Goth) {
-		g.loginPath = path
-	}
-}
-
-// Handler sets the underlying http.Handler that will be wrapped
-func Handler(h http.Handler) Opts {
-	return func(g *Goth) {
-		g.handler = h
+func (g *Goth) LoginURL(path string) {
+	if parsed, err := url.Parse(path); err != nil {
+		log.Fatalf("invalid loginUrl %q: %v", path, err)
+	} else {
+		g.loginURL = parsed
 	}
 }
 
 // AllowMissing will allow requests to undefined patterns to go through. The default behaviour is
 // to deny all requests to undefined paths.
-func AllowMissing(g *Goth) {
-	g.allowMissing = true
+func (g *Goth) AllowMissing(value bool) {
+	g.allowMissing = value
 }
-
-func server() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", index)
-
-	g := New(
-		Handler(mux),
-		Authorizer(auth),
-		LoginPath("/login"),
-		Rule("/admin/**", "admin"),
-	)
-
-	server := http.Server{
-		Addr:    ":8080",
-		Handler: g,
-	}
-
-	_ = server.ListenAndServe()
-}
-
-func auth(req *http.Request) (interface{}, []string, error) {
-	return 1, []string{"admin"}, nil
-}
-
-func index(w http.ResponseWriter, req *http.Request) {}
