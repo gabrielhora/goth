@@ -6,11 +6,19 @@ todo:
 */
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
+)
+
+type contextKey int
+
+const (
+	userKey  = contextKey(1)
+	rolesKey = contextKey(2)
 )
 
 // AuthorizeFunc returns the user as an interface type, a list of the user's roles and  an optional
@@ -54,7 +62,19 @@ type Goth struct {
 	allowMissing bool
 }
 
-type Opts func(*Goth)
+// HasRole checks if the current user have one of the roles
+func HasRole(req *http.Request, role ...string) bool {
+	userRoles, ok := req.Context().Value(rolesKey).([]string)
+	if !ok {
+		return false
+	}
+	return checkUserHasRole(role, userRoles)
+}
+
+// CurrentUser gets the user returned from the AuthorizerFunc from the request context
+func CurrentUser(req *http.Request) interface{} {
+	return req.Context().Value(userKey)
+}
 
 // New creates a new Goth instance.
 func New(handler http.Handler, authorizer AuthorizerFunc) *Goth {
@@ -81,6 +101,11 @@ func (g *Goth) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 		return
 	}
+
+	// add user and roles to request context
+	ctx := context.WithValue(req.Context(), userKey, user)
+	ctx = context.WithValue(ctx, rolesKey, userRoles)
+	req = req.WithContext(ctx)
 
 	// match the request with defined rules
 	ruleFound := false
