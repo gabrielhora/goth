@@ -71,8 +71,8 @@ func HasRole(req *http.Request, role ...string) bool {
 	return checkUserHasRole(role, userRoles)
 }
 
-// CurrentUser gets the user returned from the AuthorizerFunc from the request context
-func CurrentUser(req *http.Request) interface{} {
+// User gets the user returned from the AuthorizerFunc from the request context
+func User(req *http.Request) interface{} {
 	return req.Context().Value(userKey)
 }
 
@@ -136,6 +136,8 @@ func (g *Goth) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		g.denyRequest(w, req, user)
 	case rule.allow && user == nil:
 		g.denyRequest(w, req, user)
+	case rule.allow && user != nil:
+		g.handler.ServeHTTP(w, req)
 	case rule.annon:
 		g.handler.ServeHTTP(w, req)
 	case len(rule.roles) > 0:
@@ -186,12 +188,7 @@ func (g *Goth) denyRequest(w http.ResponseWriter, req *http.Request, user interf
 //   - "annon": any requests will be allowed even for unauthenticated users
 //   - "deny": deny all requests
 //
-// If multiple rules are matched for one request, the more restrictive pattern will be honored,
-// which means there is a precedence order of the rules:
-//
-//   deny > list of roles > allow > annon
-//
-// Also, the order of rules are important, the rule to be applied is the first one that matches
+// The order of rules are important, the rule to be applied is the first one that matches
 // based on their definition order.
 func (g *Goth) Rule(pattern, rule string) {
 	rx, err := regexp.Compile(pattern)
@@ -227,4 +224,9 @@ func (g *Goth) LoginURL(path string) {
 // to deny all requests to undefined paths.
 func (g *Goth) AllowMissing(value bool) {
 	g.allowMissing = value
+}
+
+// Authorizer sets the authorization function responsible for getting the current user
+func (g *Goth) Authorizer(fn AuthorizerFunc) {
+	g.authorizer = fn
 }
