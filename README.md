@@ -35,4 +35,10 @@ func main() {
 
     _ = server.ListenAndServe()
 }
+
+// this function should return the current user and it's roles, you are
+// free to choose how to get this info (from session, cookie, header, etc)
+func auth(req *http.Request) (user interface{}, roles []string, err error) {
+    return 1, []string{"user"}, nil
+}
 ``` 
